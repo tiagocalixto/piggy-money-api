@@ -4,10 +4,12 @@ Repositório para operações com a entidade Categoria (MySQL ↔ domínio).
 """
 from typing import Callable, Generator
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.entity.category import Category
-from infra.database.models import Categoria
+from core.entity.transaction import Transaction
+from infra.database.models import Categoria, Transacao
 
 
 class CategoryRepository:
@@ -113,5 +115,48 @@ class CategoryRepository:
         except Exception:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+    # ── consultas especializadas ──────────────
+
+    def find_by_nome(self, usuario_id: int, nome: str) -> Category | None:
+        """Busca categoria por nome (case insensitive) para validação de unicidade."""
+        session = next(self.get_session())
+        try:
+            db_cat = (
+                session.query(Categoria)
+                .filter(
+                    Categoria.usuario_id == usuario_id,
+                    func.lower(Categoria.nome) == nome.lower().strip(),
+                )
+                .first()
+            )
+            return self._to_entity(db_cat) if db_cat else None
+        finally:
+            session.close()
+
+    def find_default_category(self, usuario_id: int) -> Category | None:
+        """Busca a categoria 'Sem categoria' do usuário."""
+        return self.find_by_nome(usuario_id, "Sem categoria")
+
+    def list_transactions_by_category(
+        self, categoria_id: int
+    ) -> list[Transaction]:
+        """Lista todas as transações vinculadas a uma categoria."""
+        session = next(self.get_session())
+        try:
+            db_txs = (
+                session.query(Transacao)
+                .filter(Transacao.categoria_id == categoria_id)
+                .all()
+            )
+            from infra.repositories.transaction_repository import (
+                TransactionRepository,
+            )
+
+            return [
+                TransactionRepository._to_entity(tx) for tx in db_txs
+            ]
         finally:
             session.close()

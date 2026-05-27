@@ -4,10 +4,11 @@ Repositório para operações com a entidade Conta (MySQL ↔ domínio).
 """
 from typing import Callable, Generator
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.entity.account import Account
-from infra.database.models import Conta
+from infra.database.models import Conta, Transacao
 
 
 class AccountRepository:
@@ -107,5 +108,59 @@ class AccountRepository:
         except Exception:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+    # ── consultas especializadas ──────────────
+
+    def find_by_nome(self, usuario_id: int, nome: str) -> Account | None:
+        """Busca conta por nome (case insensitive) para validação de unicidade."""
+        session = next(self.get_session())
+        try:
+            db_account = (
+                session.query(Conta)
+                .filter(
+                    Conta.usuario_id == usuario_id,
+                    func.lower(Conta.nome) == nome.lower().strip(),
+                )
+                .first()
+            )
+            return self._to_entity(db_account) if db_account else None
+        finally:
+            session.close()
+
+    def get_balance(self, conta_id: int) -> float:
+        """Calcula o saldo atual da conta.
+        
+        Saldo = saldo_inicial + soma(entradas efetivadas) - soma(saidas efetivadas).
+        """
+        session = next(self.get_session())
+        try:
+            db_account = session.get(Conta, conta_id)
+            if db_account is None:
+                raise ValueError(f"Conta com id={conta_id} não encontrada.")
+
+            from sqlalchemy import case
+
+            saldo_total = (
+                session.query(
+                    func.coalesce(
+                        func.sum(
+                            case(
+                                (Transacao.tipo_movimento == "entrada", Transacao.valor),
+                                (Transacao.tipo_movimento == "saida", -Transacao.valor),
+                            )
+                        ),
+                        0.0,
+                    )
+                )
+                .filter(
+                    Transacao.conta_id == conta_id,
+                    Transacao.efetivada == True,
+                )
+                .scalar()
+            )
+
+            return float(db_account.saldo_inicial) + float(saldo_total)
         finally:
             session.close()

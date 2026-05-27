@@ -2,12 +2,14 @@
 """
 Repositório para operações com a entidade Transacao (MySQL ↔ domínio).
 """
-from typing import Callable, Generator
+from datetime import datetime
+from typing import Any, Callable, Generator
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from core.entity.transaction import Transaction
-from infra.database.models import Transacao
+from infra.database.models import FaturaCartao, StatusFatura, Transacao
 
 
 class TransactionRepository:
@@ -138,5 +140,180 @@ class TransactionRepository:
         except Exception:
             session.rollback()
             raise
+        finally:
+            session.close()
+
+    # ── consultas especializadas ──────────────
+
+    def list_with_filters(
+        self, usuario_id: int, filters: dict[str, Any]
+    ) -> list[Transaction]:
+        """Lista transações com filtros dinâmicos e combináveis.
+
+        Args:
+            usuario_id: ID do usuário (filtro obrigatório).
+            filters: Dicionário com filtros opcionais:
+                - data_inicio: datetime | None
+                - data_fim: datetime | None
+                - categoria_id: int | None
+                - conta_id: int | None
+                - cartao_credito_id: int | None
+                - cartao_beneficio_id: int | None
+                - tipo_movimento: str | None
+                - efetivada: bool | None
+        """
+        session = next(self.get_session())
+        try:
+            query = session.query(Transacao).filter(
+                Transacao.usuario_id == usuario_id
+            )
+
+            if filters.get("data_inicio"):
+                query = query.filter(
+                    Transacao.data >= filters["data_inicio"]
+                )
+            if filters.get("data_fim"):
+                query = query.filter(
+                    Transacao.data <= filters["data_fim"]
+                )
+            if filters.get("categoria_id") is not None:
+                query = query.filter(
+                    Transacao.categoria_id == filters["categoria_id"]
+                )
+            if filters.get("conta_id") is not None:
+                query = query.filter(
+                    Transacao.conta_id == filters["conta_id"]
+                )
+            if filters.get("cartao_credito_id") is not None:
+                query = query.filter(
+                    Transacao.cartao_credito_id
+                    == filters["cartao_credito_id"]
+                )
+            if filters.get("cartao_beneficio_id") is not None:
+                query = query.filter(
+                    Transacao.cartao_beneficio_id
+                    == filters["cartao_beneficio_id"]
+                )
+            if filters.get("tipo_movimento"):
+                query = query.filter(
+                    Transacao.tipo_movimento
+                    == filters["tipo_movimento"]
+                )
+            if filters.get("efetivada") is not None:
+                query = query.filter(
+                    Transacao.efetivada == filters["efetivada"]
+                )
+
+            db_txs = query.order_by(Transacao.data.desc()).all()
+            return [self._to_entity(tx) for tx in db_txs]
+        finally:
+            session.close()
+
+    def list_by_conta(self, conta_id: int) -> list[Transaction]:
+        """Lista transações de uma conta específica."""
+        session = next(self.get_session())
+        try:
+            db_txs = (
+                session.query(Transacao)
+                .filter(Transacao.conta_id == conta_id)
+                .order_by(Transacao.data.desc())
+                .all()
+            )
+            return [self._to_entity(tx) for tx in db_txs]
+        finally:
+            session.close()
+
+    def list_by_cartao_credito(
+        self, cartao_credito_id: int
+    ) -> list[Transaction]:
+        """Lista transações de um cartão de crédito específico."""
+        session = next(self.get_session())
+        try:
+            db_txs = (
+                session.query(Transacao)
+                .filter(
+                    Transacao.cartao_credito_id == cartao_credito_id
+                )
+                .order_by(Transacao.data.desc())
+                .all()
+            )
+            return [self._to_entity(tx) for tx in db_txs]
+        finally:
+            session.close()
+
+    def list_by_cartao_beneficio(
+        self, beneficio_id: int
+    ) -> list[Transaction]:
+        """Lista transações de um cartão de benefício específico."""
+        session = next(self.get_session())
+        try:
+            db_txs = (
+                session.query(Transacao)
+                .filter(
+                    Transacao.cartao_beneficio_id == beneficio_id
+                )
+                .order_by(Transacao.data.desc())
+                .all()
+            )
+            return [self._to_entity(tx) for tx in db_txs]
+        finally:
+            session.close()
+
+    def get_sum_by_conta(
+        self, conta_id: int, tipo_movimento: str
+    ) -> float:
+        """Soma os valores das transações efetivadas de uma conta por tipo."""
+        session = next(self.get_session())
+        try:
+            result = (
+                session.query(func.coalesce(func.sum(Transacao.valor), 0.0))
+                .filter(
+                    Transacao.conta_id == conta_id,
+                    Transacao.tipo_movimento == tipo_movimento,
+                    Transacao.efetivada == True,
+                )
+                .scalar()
+            )
+            return float(result)
+        finally:
+            session.close()
+
+    def get_sum_by_cartao_credito(self, cartao_credito_id: int) -> float:
+        """Soma dos gastos (saidas) não pagos do cartão de crédito.
+
+        Considera transações efetivadas do tipo 'saida' que estão
+        vinculadas a faturas com status 'aberta' ou 'parcial',
+        OU que ainda não possuem fatura vinculada.
+        """
+        session = next(self.get_session())
+        try:
+            # Transações em faturas abertas/parciais
+            gastos_em_faturas_abertas = (
+                session.query(func.coalesce(func.sum(Transacao.valor), 0.0))
+                .join(FaturaCartao, Transacao.fatura_id == FaturaCartao.id)
+                .filter(
+                    Transacao.cartao_credito_id == cartao_credito_id,
+                    Transacao.tipo_movimento == "saida",
+                    Transacao.efetivada == True,
+                    FaturaCartao.status.in_(
+                        [StatusFatura.ABERTA, StatusFatura.PARCIAL]
+                    ),
+                )
+                .scalar()
+            )
+
+            # Transações sem fatura vinculada (ainda não faturadas)
+            gastos_sem_fatura = (
+                session.query(func.coalesce(func.sum(Transacao.valor), 0.0))
+                .filter(
+                    Transacao.cartao_credito_id == cartao_credito_id,
+                    Transacao.tipo_movimento == "saida",
+                    Transacao.efetivada == True,
+                    Transacao.fatura_id.is_(None),
+                )
+                .scalar()
+            )
+
+            return float(gastos_em_faturas_abertas) + float(gastos_sem_fatura)
         finally:
             session.close()
